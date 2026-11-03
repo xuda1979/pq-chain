@@ -1,6 +1,9 @@
 package protocol
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Transaction kinds.
 const (
@@ -41,6 +44,18 @@ type Transaction struct {
 // ErrWrongSender is returned when a signature recovers/validates against a
 // public key that does not hash to the declared Sender address.
 var ErrWrongSender = errors.New("protocol: signer does not match sender address")
+
+// ErrInvalidField is returned when a structurally decoded value violates
+// protocol rules (unknown kind, unsupported scheme, oversized field).
+var ErrInvalidField = errors.New("protocol: invalid field value")
+
+// MaxSignatureSize bounds any on-chain signature (ML-DSA-87 max is 4627
+// bytes; the cap leaves headroom for future schemes). Consensus limit.
+const MaxSignatureSize = 8192
+
+// MaxPayloadSize bounds transaction payloads (e.g. registered public keys,
+// whose largest encoding is ML-DSA-87 at 2592 bytes). Consensus limit.
+const MaxPayloadSize = 8192
 
 // Marshal encodes the transaction, including the signature, in canonical form.
 func (t *Transaction) Marshal() []byte {
@@ -85,19 +100,37 @@ func (t *Transaction) Unmarshal(data []byte) error {
 	if t.Payload, err = r.Bytes(); err != nil {
 		return err
 	}
+	if len(t.Payload) > MaxPayloadSize {
+		return fmt.Errorf("%w: payload %d bytes exceeds %d", ErrInvalidField, len(t.Payload), MaxPayloadSize)
+	}
 	scheme, err := r.Uint8()
 	if err != nil {
 		return err
 	}
 	t.SigScheme = SignatureScheme(scheme)
+	switch t.SigScheme {
+	case SchemeMLDSA44, SchemeMLDSA65, SchemeMLDSA87:
+	default:
+		return fmt.Errorf("%w: unknown signature scheme %d", ErrInvalidField, uint8(t.SigScheme))
+	}
 	if t.Signature, err = r.Bytes(); err != nil {
 		return err
+	}
+	if len(t.Signature) > MaxSignatureSize {
+		return fmt.Errorf("%w: signature %d bytes exceeds %d", ErrInvalidField, len(t.Signature), MaxSignatureSize)
 	}
 	if r.Remaining() != 0 {
 		return ErrTrailingBytes
 	}
 	return nil
 }
+
+// MaxBlockTransactions is the consensus limit on transactions per block.
+const MaxBlockTransactions = 100_000
+
+// MaxBlockSize bounds the total marshaled size of a transaction for
+// network and memory safety before signature verification runs.
+const MaxBlockSize = 1 << 20 // 1 MiB
 
 // SignBytes returns the canonical byte string that a signature must cover:
 // domain tag, chain ID, the unsigned transaction fields, and the Merkle
@@ -122,3 +155,7 @@ func (t *Transaction) SignBytes() []byte {
 func (t *Transaction) Hash() Hash {
 	return HashBytes(t.Marshal())
 }
+
+// MaxHeaderSize bounds a marshaled header (proposer signatures are covered
+// by MaxSignatureSize, so a few hundred bytes suffice).
+const MaxHeaderSize = 16 * 1024

@@ -38,6 +38,25 @@ func newTestChain(t *testing.T) (*State, *crypto.Registry, *crypto.MLDSASuite, c
 	return s, reg, suite, pk, sk
 }
 
+// newStakedProposer registers a funded, staked proposer account and
+// returns its address and signing key.
+func newStakedProposer(t *testing.T, s *State, suite *crypto.MLDSASuite) (protocol.Address, crypto.PrivateKey) {
+	t.Helper()
+	pk, sk, err := suite.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := crypto.DeriveAddress(protocol.SchemeMLDSA65, pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Accounts[addr] = &Account{Balance: 100 * MinStake, Staked: MinStake}
+	if err := register(s, addr, pk); err != nil {
+		t.Fatal(err)
+	}
+	return addr, sk
+}
+
 func register(s *State, addr protocol.Address, pk crypto.PublicKey) error {
 	a, ok := s.Accounts[addr]
 	if !ok {
@@ -221,8 +240,7 @@ func TestFeeFloorAndUnknownKind(t *testing.T) {
 func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 	s, reg, suite, pk, sk := newTestChain(t)
 	sender := senderAddr(t, s)
-	proposer := protocol.Address{7}
-	s.Accounts[proposer] = &Account{Balance: 0}
+	proposer, proposerSK := newStakedProposer(t, s, suite)
 
 	// Set up parent block linkage.
 	parentHeader := &protocol.BlockHeader{Version: 1, Height: 1, Proposer: proposer}
@@ -246,6 +264,7 @@ func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 		Transactions: []*protocol.Transaction{tx1, tx2},
 	}
 	block.Header.TxRoot = block.ComputeTxRoot()
+	signBlock(t, suite, proposerSK, &block.Header)
 
 	// Tamper the root: must be rejected.
 	tampered := *block
@@ -253,6 +272,29 @@ func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 	tampered.Header.TxRoot = protocol.ZeroHash
 	if _, err := ApplyBlock(s, reg, &tampered); err == nil {
 		t.Fatal("tampered tx root accepted")
+	}
+
+	// Unsigned header: must be rejected (anyone could else claim fees).
+	unsigned := *block
+	unsigned.Header = block.Header
+	unsigned.Header.ProposerSig = nil
+	if _, err := ApplyBlock(s, reg, &unsigned); err == nil {
+		t.Fatal("unsigned header accepted")
+	}
+
+	// Unstaked proposer: must be rejected.
+	unstaked := s.Clone()
+	unstaked.Accounts[proposer].Staked = 0
+	if _, err := ApplyBlock(unstaked, reg, block); err == nil {
+		t.Fatal("unstaked proposer accepted")
+	}
+
+	// Wrong block version: must be rejected.
+	badVer := *block
+	badVer.Header = block.Header
+	badVer.Header.Version = 99
+	if _, err := ApplyBlock(s, reg, &badVer); err == nil {
+		t.Fatal("bad version accepted")
 	}
 
 	next, err := ApplyBlock(s, reg, block)
@@ -265,8 +307,8 @@ func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 	if !next.LastBlockHash.Equal(block.Header.Hash()) {
 		t.Fatal("last block hash not updated")
 	}
-	if got := next.Accounts[proposer].Balance; got != 12*BaseFee {
-		t.Fatalf("proposer fees = %d, want %d", got, 12*BaseFee)
+	if got := next.Accounts[proposer].Balance; got != 100*MinStake+12*BaseFee {
+		t.Fatalf("proposer fees = %d, want %d", got, 100*MinStake+12*BaseFee)
 	}
 	if got := next.Accounts[recipient].Balance; got != 3*MinStake {
 		t.Fatalf("recipient = %d", got)
@@ -275,6 +317,16 @@ func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 		t.Fatalf("staked = %d", got)
 	}
 	_ = pk
+}
+
+// signBlock signs a block header in place with the proposer's key.
+func signBlock(t *testing.T, suite *crypto.MLDSASuite, sk crypto.PrivateKey, h *protocol.BlockHeader) {
+	t.Helper()
+	sig, err := suite.Sign(sk, h.SignBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.ProposerSig = sig
 }
 
 func TestTotalSupplyConservation(t *testing.T) {

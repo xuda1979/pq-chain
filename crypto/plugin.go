@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ type PluginManifest struct {
 // ErrPluginNotFound is returned when a manifest or binary is missing.
 var ErrPluginNotFound = errors.New("crypto: plugin not found")
 
+// ErrBadManifest is returned when a manifest is malformed or references
+// files outside the plugin directory.
+var ErrBadManifest = errors.New("crypto: bad plugin manifest")
+
 // LoadPluginManifest reads and validates a plugin manifest (manifest.json)
 // from dir. It does not load code; it only parses metadata.
 func LoadPluginManifest(dir string) (*PluginManifest, error) {
@@ -39,10 +44,21 @@ func LoadPluginManifest(dir string) (*PluginManifest, error) {
 	}
 	var m PluginManifest
 	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("crypto: bad plugin manifest: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrBadManifest, err)
 	}
 	if m.Name == "" || m.Binary == "" {
-		return nil, fmt.Errorf("crypto: plugin manifest missing name/binary")
+		return nil, fmt.Errorf("%w: missing name/binary", ErrBadManifest)
+	}
+	// The manifest names the binary relative to the plugin dir; reject
+	// anything that escapes it (absolute paths, "..", separators).
+	if filepath.IsAbs(m.Binary) || m.Binary != filepath.Clean(filepath.Base(m.Binary)) {
+		return nil, fmt.Errorf("%w: binary %q must be a plain file name", ErrBadManifest, m.Binary)
+	}
+	if len(m.SHA256) != 64 {
+		return nil, fmt.Errorf("%w: sha256 must be 64 hex chars", ErrBadManifest)
+	}
+	if _, err := hex.DecodeString(m.SHA256); err != nil {
+		return nil, fmt.Errorf("%w: sha256 is not hex: %w", ErrBadManifest, err)
 	}
 	return &m, nil
 }

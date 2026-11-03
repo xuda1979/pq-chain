@@ -33,8 +33,11 @@ var VendorReleaseKey ed25519.PublicKey
 //  2. the detached Ed25519 signature over that hash,
 //  3. the plugin handshake reports the expected ABI version and scheme.
 //
-// It never loads unsigned plugins. Verify paths always stay in
-// open-source code; plugins only accelerate signing.
+// To close the TOCTOU gap between verification and execution, the exact
+// verified bytes are copied to a private temporary file and executed from
+// there — a concurrent swap of the original path cannot change what runs.
+// It never loads unsigned plugins. Verify paths always stay in open-source
+// code; plugins only accelerate signing.
 func LoadAcceleratedSigner(dir string, wantScheme protocol.SignatureScheme) (Signer, func(), error) {
 	manifest, err := LoadPluginManifest(dir)
 	if err != nil {
@@ -64,9 +67,20 @@ func LoadAcceleratedSigner(dir string, wantScheme protocol.SignatureScheme) (Sig
 		return nil, nil, fmt.Errorf("%w: bad signature", ErrPluginIntegrity)
 	}
 
-	// 3. Handshake via the plugin protocol (stdout handshake line, then
+	// 3. Execute exactly the verified bytes: stage a private temp copy
+	// (0700, not in the plugin dir, which may be a read-only mount) and
+	// run that. The copy is removed once the plugin has started — the
+	// kernel keeps the inode alive for the running process — so a
+	// concurrent swap of the original path cannot change what runs.
+	staged, err := stageVerifiedBinary(bin)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer os.Remove(staged)
+
+	// 4. Handshake via the plugin protocol (stdout handshake line, then
 	// JSON-RPC over a unix socket).
-	client, err := plugin.Dial(binPath)
+	client, err := plugin.Dial(staged)
 	if err != nil {
 		return nil, nil, fmt.Errorf("crypto: plugin dial: %w", err)
 	}
@@ -76,4 +90,34 @@ func LoadAcceleratedSigner(dir string, wantScheme protocol.SignatureScheme) (Sig
 		return nil, nil, err
 	}
 	return signer, func() { signer.Close() }, nil
+}
+
+// stageVerifiedBinary writes the verified plugin bytes to a fresh private
+// executable file in the system temp dir and returns its path.
+func stageVerifiedBinary(bin []byte) (string, error) {
+	tmp, err := os.CreateTemp("", "pqc-plugin-verified-")
+	if err != nil {
+		return "", fmt.Errorf("crypto: stage verified plugin: %w", err)
+	}
+	path := tmp.Name()
+	// Best-effort removal if anything below fails.
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(path)
+		}
+	}()
+	if _, err := tmp.Write(bin); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("crypto: stage verified plugin: %w", err)
+	}
+	if err := tmp.Chmod(0o700); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("crypto: stage verified plugin: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("crypto: stage verified plugin: %w", err)
+	}
+	ok = true
+	return path, nil
 }

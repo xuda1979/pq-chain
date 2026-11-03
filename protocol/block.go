@@ -1,5 +1,7 @@
 package protocol
 
+import "fmt"
+
 // BlockHeader carries the consensus-critical fields of a block.
 type BlockHeader struct {
 	// Version is the block format version (currently 1).
@@ -66,6 +68,9 @@ func (h *BlockHeader) Unmarshal(data []byte) error {
 	if h.ProposerSig, err = r.Bytes(); err != nil {
 		return err
 	}
+	if len(h.ProposerSig) > MaxSignatureSize {
+		return fmt.Errorf("%w: header signature %d bytes exceeds %d", ErrInvalidField, len(h.ProposerSig), MaxSignatureSize)
+	}
 	if r.Remaining() != 0 {
 		return ErrTrailingBytes
 	}
@@ -92,6 +97,9 @@ func (h *BlockHeader) SignBytes() []byte {
 	b = append(b, h.Proposer[:]...)
 	return b
 }
+
+// Len returns the number of transactions in the block.
+func (b *Block) Len() int { return len(b.Transactions) }
 
 // ComputeTxRoot computes the Merkle root over the transaction hashes.
 // Blocks with zero transactions use the zero hash as their TxRoot.

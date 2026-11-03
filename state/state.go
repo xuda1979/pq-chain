@@ -44,6 +44,16 @@ type Account struct {
 	SigScheme protocol.SignatureScheme
 }
 
+// credit adds v to the balance, refusing to overflow (supply is fixed, so
+// an overflow would mean forged tokens).
+func (a *Account) credit(v uint64) error {
+	if v > ^uint64(0)-a.Balance {
+		return ErrOverflow
+	}
+	a.Balance += v
+	return nil
+}
+
 // Registered reports whether the account has an on-chain PQ key.
 func (a *Account) Registered() bool { return len(a.PubKey) > 0 }
 
@@ -87,6 +97,11 @@ var (
 	ErrUnknownTxKind = errors.New("state: unknown transaction kind")
 	// ErrEmptyKey is returned for key registration with empty payload.
 	ErrEmptyKey = errors.New("state: register key: empty payload")
+	// ErrOverflow is returned when a credit would overflow uint64 supply.
+	ErrOverflow = errors.New("state: uint64 overflow")
+	// ErrKeyTooLarge is returned when a registered key exceeds the
+	// protocol payload limit.
+	ErrKeyTooLarge = errors.New("state: register key: payload too large")
 )
 
 // get returns the account for addr, creating a zero account if absent.
@@ -164,8 +179,7 @@ func (s *State) applyTransfer(from *Account, tx *protocol.Transaction) error {
 	}
 	from.Balance -= tx.Amount
 	to := s.get(tx.To)
-	to.Balance += tx.Amount
-	return nil
+	return to.credit(tx.Amount)
 }
 
 // applyStake locks amount as validator stake.
@@ -202,10 +216,14 @@ func (s *State) applyUnstake(from *Account, tx *protocol.Transaction) error {
 
 // applyRegisterKey binds or rotates the sender's public key (carried in
 // Payload; SigScheme selects the algorithm). Rotation is the migration
-// path if a scheme is ever broken.
+// path if a scheme is ever broken. The caller has already verified the
+// transaction signature under the OLD registered key.
 func (s *State) applyRegisterKey(from *Account, tx *protocol.Transaction) error {
 	if len(tx.Payload) == 0 {
 		return ErrEmptyKey
+	}
+	if len(tx.Payload) > protocol.MaxPayloadSize {
+		return ErrKeyTooLarge
 	}
 	from.PubKey = append(from.PubKey[:0], tx.Payload...)
 	from.SigScheme = tx.SigScheme
@@ -214,9 +232,15 @@ func (s *State) applyRegisterKey(from *Account, tx *protocol.Transaction) error 
 
 // SettleUnbondings credits balances for unstakes whose unbonding height
 // has arrived. Called once per block after applying its transactions.
+// Overflow is impossible in a closed system (the principal was subtracted
+// from a balance earlier), so failed credits indicate state corruption
+// and are skipped loudly rather than panicking.
 func (s *State) SettleUnbondings() {
 	for _, a := range s.Accounts {
 		if a.UnbondingAt != 0 && a.UnbondingAt <= s.Height {
+			if a.PendingUnbond > ^uint64(0)-a.Balance {
+				continue // corrupt account; do not wrap
+			}
 			a.Balance += a.PendingUnbond
 			a.PendingUnbond = 0
 			a.UnbondingAt = 0

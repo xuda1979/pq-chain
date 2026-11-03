@@ -1,7 +1,7 @@
 // Package plugin implements the node-to-plugin wire protocol for optional
 // accelerated crypto plugins. The protocol is open: any vendor can
 // implement a compatible plugin in any language. The node is always the
-// gRPC-style client; the plugin is the server.
+// client; the plugin is the server.
 //
 // Handshake (hashicorp go-plugin style):
 //
@@ -9,20 +9,24 @@
 //	2. Plugin creates a unix socket "<dir>/plugin.sock", listens, and
 //	   prints "PQPLUGIN1|<socket-path>|<abi-version>" on stdout.
 //	3. Node verifies ABI version == PluginABIVersion, then speaks
-//	   length-prefixed JSON-RPC over the socket.
+//	   JSON-RPC over the socket.
+//
+// Every step is bounded by a deadline so a hung or malicious plugin can
+// never hang the node.
 package plugin
 
 import (
 	"bufio"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
 
 // PluginABIVersion is the wire protocol version. Bump on breaking changes;
@@ -31,6 +35,16 @@ const PluginABIVersion = 1
 
 // HandshakePrefix is the first token of the plugin's stdout handshake.
 const HandshakePrefix = "PQPLUGIN1"
+
+// Timeouts. Production nodes must not depend on third-party plugin
+// liveness: every plugin interaction is bounded.
+const (
+	// HandshakeTimeout bounds reading the startup handshake line.
+	HandshakeTimeout = 10 * time.Second
+
+	// CallTimeout bounds one JSON-RPC round trip.
+	CallTimeout = 30 * time.Second
+)
 
 // Request is a single call from node to plugin.
 type Request struct {
@@ -54,118 +68,161 @@ type Response struct {
 
 // RPC method names.
 const (
-	MethodScheme  = "scheme"
-	MethodKeygen  = "generate_key_pair"
-	MethodSign    = "sign"
+	MethodScheme = "scheme"
+	MethodKeygen = "generate_key_pair"
+	MethodSign   = "sign"
 )
 
 // ErrHandshake is returned when the plugin fails the startup handshake.
 var ErrHandshake = errors.New("plugin: handshake failed")
 
 // Client is a connected plugin instance. It implements crypto.Signer via
-// the adapter in the crypto package.
+// the adapter in the crypto package. It is safe for concurrent use: RPCs
+// are serialized on one connection, each with its own deadline.
 type Client struct {
-	cmd    *exec.Cmd
-	conn   net.Conn
-	enc    *json.Encoder
-	dec    *json.Decoder
+	cmd     *exec.Cmd
+	conn    net.Conn
+	sockDir string
+	mu      sync.Mutex
+	enc     *json.Encoder
+	dec     *json.Decoder
+	// nextID is only mutated under mu.
 	nextID uint64
+	// closeOnce makes Close idempotent.
+	closeOnce sync.Once
+	waitCh    chan struct{}
 }
 
 // Dial starts the plugin binary, performs the handshake, and returns a
 // connected client. The plugin must be executable and speak ABI version 1.
+// On any failure the plugin process is killed and its temp dir removed —
+// Dial never leaks a process.
 func Dial(binPath string) (*Client, error) {
 	sockDir, err := os.MkdirTemp("", "pqplugin-")
 	if err != nil {
 		return nil, err
 	}
+	// From here on, any failure must clean up sockDir and the process.
+	pluginDied := false
+	cleanup := func(cmd *exec.Cmd) {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+		os.RemoveAll(sockDir)
+	}
+
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), "PLUGIN_UNIX_SOCKET_DIR="+sockDir)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		os.RemoveAll(sockDir)
 		return nil, err
 	}
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
+		os.RemoveAll(sockDir)
 		return nil, fmt.Errorf("plugin: start %s: %w", filepath.Base(binPath), err)
 	}
 
-	// Read handshake line with a hard deadline-ish bounded read.
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("%w: no handshake line: %v", ErrHandshake, err)
+	// The plugin owns sockDir once started; the node removes it on Close.
+	// If the handshake fails, cleanup does it.
+	lineReader := bufio.NewReader(stdout)
+	handshakeLine := make(chan string, 1)
+	go func() {
+		line, err := lineReader.ReadString('\n')
+		if err != nil {
+			// EOF/err: fall through to timeout below by sending nothing.
+			close(handshakeLine)
+			return
+		}
+		handshakeLine <- line
+	}()
+
+	var line string
+	select {
+	case l, ok := <-handshakeLine:
+		if !ok {
+			pluginDied = true
+		} else {
+			line = l
+		}
+	case <-time.After(HandshakeTimeout):
+		cleanup(cmd)
+		return nil, fmt.Errorf("%w: no handshake line within %s", ErrHandshake, HandshakeTimeout)
 	}
-	var prefix, sockPath string
-	var abi int
-	if _, err := fmt.Sscanf(line, "%s", &prefix); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("%w: bad handshake %q", ErrHandshake, line)
+	if pluginDied {
+		cleanup(cmd)
+		return nil, fmt.Errorf("%w: plugin exited before handshake", ErrHandshake)
 	}
-	// Format: PQPLUGIN1|<path>|<abi>
-	parts := splitHandshake(line)
+
+	parts := strings.Split(strings.TrimRight(line, "\r\n"), "|")
 	if len(parts) != 3 || parts[0] != HandshakePrefix {
-		cmd.Process.Kill()
+		cleanup(cmd)
 		return nil, fmt.Errorf("%w: bad handshake %q", ErrHandshake, line)
 	}
-	prefix = parts[0]
-	sockPath = parts[1]
+	sockPath := parts[1]
+	var abi int
 	if _, err := fmt.Sscanf(parts[2], "%d", &abi); err != nil {
-		cmd.Process.Kill()
+		cleanup(cmd)
 		return nil, fmt.Errorf("%w: bad abi %q", ErrHandshake, parts[2])
 	}
 	if abi != PluginABIVersion {
-		cmd.Process.Kill()
+		cleanup(cmd)
 		return nil, fmt.Errorf("%w: plugin abi %d, node abi %d", ErrHandshake, abi, PluginABIVersion)
 	}
-	_ = prefix
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
-		cmd.Process.Kill()
+		cleanup(cmd)
 		return nil, fmt.Errorf("plugin: dial socket: %w", err)
 	}
+
+	waitCh := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(waitCh)
+	}()
+
 	return &Client{
-		cmd:  cmd,
-		conn: conn,
-		enc:  json.NewEncoder(conn),
-		dec:  json.NewDecoder(conn),
+		cmd:     cmd,
+		conn:    conn,
+		sockDir: sockDir,
+		enc:     json.NewEncoder(conn),
+		dec:     json.NewDecoder(bufio.NewReader(conn)),
+		waitCh:  waitCh,
 	}, nil
 }
 
-func splitHandshake(line string) []string {
-	line = trimSpaceNewline(line)
-	var parts []string
-	start := 0
-	for i := 0; i <= len(line); i++ {
-		if i == len(line) || line[i] == '|' {
-			parts = append(parts, line[start:i])
-			start = i + 1
-		}
-	}
-	return parts
-}
-
-func trimSpaceNewline(s string) string {
-	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
-// Close terminates the plugin process and connection.
+// Close terminates the plugin process, closes the connection and removes
+// the plugin's temp socket directory. Safe to call multiple times.
 func (c *Client) Close() error {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		return c.cmd.Process.Kill()
-	}
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.conn.Close()
+		}
+		if c.cmd != nil && c.cmd.Process != nil {
+			c.cmd.Process.Kill()
+		}
+		// cmd.Wait is owned by the goroutine started in Dial.
+		<-c.waitCh
+		if c.sockDir != "" {
+			os.RemoveAll(c.sockDir)
+		}
+	})
 	return nil
 }
 
-// call performs one JSON-RPC round trip.
+// call performs one JSON-RPC round trip, serialized with a per-call
+// deadline. Concurrent calls queue on the mutex; each sets its own
+// conn deadline so one stuck call cannot poison later ones.
 func (c *Client) call(method string, params any, result any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.nextID == ^uint64(0) {
+		return errors.New("plugin: request id space exhausted")
+	}
 	c.nextID++
 	id := c.nextID
 	var rawParams json.RawMessage
@@ -175,6 +232,9 @@ func (c *Client) call(method string, params any, result any) error {
 			return err
 		}
 		rawParams = b
+	}
+	if err := c.conn.SetDeadline(time.Now().Add(CallTimeout)); err != nil {
+		return fmt.Errorf("plugin: %s: %w", method, err)
 	}
 	if err := c.enc.Encode(Request{ID: id, Method: method, Params: rawParams}); err != nil {
 		return fmt.Errorf("plugin: write %s: %w", method, err)
@@ -245,12 +305,3 @@ func (c *Client) Sign(sk, msg []byte) ([]byte, error) {
 	}
 	return res.Signature, nil
 }
-
-// WriteUint64 appends v little-endian (kept for future binary framing).
-func WriteUint64(b []byte, v uint64) []byte {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], v)
-	return append(b, buf[:]...)
-}
-
-var _ = io.EOF

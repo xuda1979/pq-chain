@@ -123,6 +123,13 @@ func (r *Reader) Uint8() (uint8, error) {
 	return v, nil
 }
 
+// MaxVarBytes is the largest length-prefixed byte string the Reader
+// accepts. Decoders must stay within consensus limits (the largest legal
+// field is an ML-DSA-87 signature at 4627 bytes); a generous cap stops
+// malformed input from allocating huge buffers before the caller-level
+// size checks run.
+const MaxVarBytes = 1 << 20 // 1 MiB
+
 // Bytes reads a length-prefixed byte string.
 func (r *Reader) Bytes() ([]byte, error) {
 	n, err := r.Uint32()
@@ -130,6 +137,9 @@ func (r *Reader) Bytes() ([]byte, error) {
 		return nil, err
 	}
 	if uint64(n) > uint64(r.Remaining()) {
+		return nil, ErrMalformed
+	}
+	if n > MaxVarBytes {
 		return nil, ErrMalformed
 	}
 	v := make([]byte, n)
