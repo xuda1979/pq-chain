@@ -33,6 +33,7 @@ consensus path.
 protocol/   canonical types: block, transaction, hashing, serialization
 crypto/     signer/verifier interfaces, ML-DSA suites, plugin loader
 plugin/     node⇄plugin wire protocol (client and server side)
+state/      account state machine, staking, tx/block application, fees
 ```
 
 ## Quick start
@@ -66,6 +67,13 @@ A plugin is a directory containing:
 - `binary.sig` — Ed25519 signature of the binary hash by the vendor key
 
 Unsigned or hash-mismatched plugins are refused.
+
+## Open-source policy
+
+The normative statement of the open-core split — what is open, what may
+be proprietary, and the compliance rules the proprietary side follows —
+is [docs/OPEN-SOURCE-POLICY.md](docs/OPEN-SOURCE-POLICY.md) (bilingual,
+the whitepaper "open-source policy" chapter).
 
 ## Security policy
 

@@ -10,6 +10,9 @@ const (
 	TxStake uint8 = 2
 	// TxUnstake unlocks staked tokens (subject to unbonding delay).
 	TxUnstake uint8 = 3
+	// TxRegisterKey binds or rotates the sender's on-chain PQ public key.
+	// Rotation is the migration path if a scheme is ever broken.
+	TxRegisterKey uint8 = 4
 )
 
 // Transaction is the canonical on-chain transaction. The signature is
