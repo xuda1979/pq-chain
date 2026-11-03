@@ -85,6 +85,44 @@ func (s *MLDSASuite) Verify(pk PublicKey, msg, sig Signature) error {
 	return mldsa.Verify(pub, msg, sig, nil)
 }
 
+// PublicKeySize returns the raw public key size for a scheme (FIPS 204
+// parameter-set constants). Consensus code uses it to reject keys that
+// could never verify before they are committed to state.
+func PublicKeySize(scheme protocol.SignatureScheme) (int, error) {
+	switch scheme {
+	case protocol.SchemeMLDSA44:
+		return 1312, nil
+	case protocol.SchemeMLDSA65:
+		return 1952, nil
+	case protocol.SchemeMLDSA87:
+		return 2592, nil
+	default:
+		return 0, ErrUnsupportedScheme
+	}
+}
+
+// ValidatePublicKey checks that pk is well-formed for scheme: correct size
+// and parseable by the reference implementation. State transitions use it
+// so an account can never register a key that would brick it (a malformed
+// key makes every future signature check fail, which is unrecoverable).
+func ValidatePublicKey(scheme protocol.SignatureScheme, pk PublicKey) error {
+	params, err := paramsFor(scheme)
+	if err != nil {
+		return err
+	}
+	want, err := PublicKeySize(scheme)
+	if err != nil {
+		return err
+	}
+	if len(pk) != want {
+		return fmt.Errorf("%w: public key size %d, want %d", ErrInvalidKey, len(pk), want)
+	}
+	if _, err := mldsa.NewPublicKey(params, pk); err != nil {
+		return fmt.Errorf("%w: unparseable public key", ErrInvalidKey)
+	}
+	return nil
+}
+
 // KeyFingerprint gives a short human-checkable fingerprint of a public key,
 // useful for display and auditing ("address ending" in UIs). Not part of
 // consensus.

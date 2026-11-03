@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/your-org/pq-chain-public/crypto"
 	"github.com/your-org/pq-chain-public/protocol"
 )
 
@@ -45,7 +46,11 @@ func FuzzApplyTransactionArbitraryTx(f *testing.F) {
 			errors.Is(err, ErrStakeTooLow),
 			errors.Is(err, ErrInsufficientStake),
 			errors.Is(err, ErrUnstakePending),
-			errors.Is(err, ErrUnknownTxKind):
+			errors.Is(err, ErrUnknownTxKind),
+			errors.Is(err, ErrEmptyKey),
+			errors.Is(err, ErrKeyTooLarge),
+			errors.Is(err, crypto.ErrInvalidKey),
+			errors.Is(err, crypto.ErrUnsupportedScheme):
 		default:
 			t.Fatalf("unexpected error type: %v", err)
 		}

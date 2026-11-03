@@ -48,7 +48,7 @@ func Serve(handler Handler) error {
 			return fmt.Errorf("plugin: read: %w", err)
 		}
 		resp := Response{ID: req.ID}
-		result, err := dispatch(handler, req)
+		result, err := serveOne(handler, req)
 		if err != nil {
 			resp.Error = err.Error()
 		} else {
@@ -63,6 +63,18 @@ func Serve(handler Handler) error {
 			return fmt.Errorf("plugin: write: %w", err)
 		}
 	}
+}
+
+// serveOne dispatches one request with panic isolation: a vendor handler
+// that panics returns an RPC error instead of killing the plugin process
+// (which would take the node's accelerated-signing capability down).
+func serveOne(h Handler, req Request) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result, err = nil, fmt.Errorf("plugin: handler panicked: %v", r)
+		}
+	}()
+	return dispatch(h, req)
 }
 
 // dispatch routes one request to the handler.

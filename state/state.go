@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/your-org/pq-chain-public/crypto"
 	"github.com/your-org/pq-chain-public/protocol"
 )
 
@@ -66,6 +67,10 @@ type State struct {
 	Height uint64
 	// LastBlockHash is the hash of the last applied block header.
 	LastBlockHash protocol.Hash
+	// LastBlockTime is the timestamp of the last applied block, in unix
+	// milliseconds. 0 means no block carried a timestamp yet. Consensus
+	// rule: the next block's timestamp must be strictly greater.
+	LastBlockTime uint64
 }
 
 // New returns an empty state at height 0.
@@ -123,7 +128,7 @@ func (s *State) Clone() *State {
 		cp.PubKey = append([]byte(nil), a.PubKey...)
 		accounts[addr] = &cp
 	}
-	return &State{Accounts: accounts, Height: s.Height, LastBlockHash: s.LastBlockHash}
+	return &State{Accounts: accounts, Height: s.Height, LastBlockHash: s.LastBlockHash, LastBlockTime: s.LastBlockTime}
 }
 
 // ApplyTransaction applies one transaction to a cloned state and returns
@@ -216,14 +221,21 @@ func (s *State) applyUnstake(from *Account, tx *protocol.Transaction) error {
 
 // applyRegisterKey binds or rotates the sender's public key (carried in
 // Payload; SigScheme selects the algorithm). Rotation is the migration
-// path if a scheme is ever broken. The caller has already verified the
-// transaction signature under the OLD registered key.
+// path if a scheme is ever broken. The caller (VerifyTransaction) has
+// already authenticated the transaction: enrollment signatures verify
+// under the payload key itself, rotations under the OLD registered key.
+// The final defense here is well-formedness: a key that could never
+// verify would permanently brick the account, so only valid keys for the
+// declared scheme are accepted.
 func (s *State) applyRegisterKey(from *Account, tx *protocol.Transaction) error {
 	if len(tx.Payload) == 0 {
 		return ErrEmptyKey
 	}
 	if len(tx.Payload) > protocol.MaxPayloadSize {
 		return ErrKeyTooLarge
+	}
+	if err := crypto.ValidatePublicKey(tx.SigScheme, crypto.PublicKey(tx.Payload)); err != nil {
+		return fmt.Errorf("state: register key: %w", err)
 	}
 	from.PubKey = append(from.PubKey[:0], tx.Payload...)
 	from.SigScheme = tx.SigScheme

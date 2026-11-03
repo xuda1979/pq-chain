@@ -1,7 +1,9 @@
 package state
 
 import (
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/your-org/pq-chain-public/crypto"
 	"github.com/your-org/pq-chain-public/protocol"
@@ -38,19 +40,48 @@ func NewGenesis(alloc []Allocation) (*State, error) {
 	return s, nil
 }
 
+// MaxFutureBlockTime is how far a block timestamp may sit in the future
+// relative to the verifying node's clock. Blocks further ahead are
+// rejected so a faulty clock on one proposer cannot push the chain's
+// median time forward unboundedly.
+const MaxFutureBlockTime = 2 * time.Minute
+
 // VerifyTransaction checks a transaction's signature against the
 // sender's registered on-chain key using only OPEN-SOURCE verification.
-// Unregistered senders are rejected; this is the crypto↔state seam.
+// It also implements the two account-lifecycle rules:
+//
+//   - Enrollment (first registration): the sender has no key yet, so the
+//     payload must carry a self-certifying key — one whose derived address
+//     equals the sender address. The signature must verify under that
+//     payload key, proving ownership.
+//   - Key rotation: the sender IS registered, and the transaction rotates
+//     the key (TxRegisterKey with a payload). The signature must verify
+//     under the OLD registered key — rotation is authorized by the
+//     incumbent — and SignBytes commits to the new key and scheme, so a
+//     rotation signature cannot be replayed as anything else.
+//
+// Ordinary transactions from registered senders verify under the
+// registered key as usual.
 func VerifyTransaction(s *State, reg *crypto.Registry, tx *protocol.Transaction) error {
 	from, ok := s.Accounts[tx.Sender]
 	if !ok {
 		return ErrUnknownAccount
 	}
 	if !from.Registered() {
-		return fmt.Errorf("state: sender %x has no registered key", tx.Sender[:4])
+		// Enrollment path: only key registration is allowed, and the
+		// payload key must derive to the sender address (self-certifying).
+		if tx.Kind != protocol.TxRegisterKey {
+			return fmt.Errorf("state: sender %x has no registered key", tx.Sender[:4])
+		}
+		return verifyEnrollment(s, reg, tx)
 	}
-	// The signature scheme must match the registered key's scheme.
-	if tx.SigScheme != from.SigScheme {
+	// Registered sender: the signature must verify under the OLD
+	// registered key. For TxRegisterKey that authorizes rotation: the tx
+	// may carry a DIFFERENT scheme and key in Payload (the migration path
+	// when a scheme is broken), and SignBytes commits to the new key and
+	// scheme, so the incumbent's signature cannot be replayed elsewhere.
+	// For all other kinds the tx scheme must match the registered one.
+	if tx.Kind != protocol.TxRegisterKey && tx.SigScheme != from.SigScheme {
 		return fmt.Errorf("state: tx scheme %s does not match registered %s",
 			tx.SigScheme, from.SigScheme)
 	}
@@ -59,6 +90,35 @@ func VerifyTransaction(s *State, reg *crypto.Registry, tx *protocol.Transaction)
 		return fmt.Errorf("state: %w", err)
 	}
 	if err := v.Verify(crypto.PublicKey(from.PubKey), tx.SignBytes(), tx.Signature); err != nil {
+		return fmt.Errorf("state: signature rejected: %w", err)
+	}
+	return nil
+}
+
+// ErrKeyMismatch is returned when a registration payload key does not
+// derive to the sender address (enrollment) or the signature scheme does
+// not match the payload key (rotation).
+var ErrKeyMismatch = errors.New("state: key does not match sender address")
+
+// verifyEnrollment validates the first registration of a sender: the
+// payload must be a well-formed public key for the declared scheme whose
+// address equals the sender, and the signature must verify under it.
+func verifyEnrollment(s *State, reg *crypto.Registry, tx *protocol.Transaction) error {
+	if err := crypto.ValidatePublicKey(tx.SigScheme, crypto.PublicKey(tx.Payload)); err != nil {
+		return fmt.Errorf("state: enrollment key: %w", err)
+	}
+	addr, err := crypto.DeriveAddress(tx.SigScheme, crypto.PublicKey(tx.Payload))
+	if err != nil {
+		return err
+	}
+	if addr != tx.Sender {
+		return ErrKeyMismatch
+	}
+	v, err := reg.Verifier(tx.SigScheme)
+	if err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
+	if err := v.Verify(crypto.PublicKey(tx.Payload), tx.SignBytes(), tx.Signature); err != nil {
 		return fmt.Errorf("state: signature rejected: %w", err)
 	}
 	return nil
@@ -74,11 +134,12 @@ const BlockVersion = 1
 //  2. height = parent height + 1
 //  3. PrevHash = parent LastBlockHash
 //  4. TxRoot matches the recomputed Merkle root
-//  5. the proposer is a staked account and the header carries a valid
+//  5. the timestamp is sane: strictly after the parent's, bounded drift
+//  6. the proposer is a staked account and the header carries a valid
 //     proposer signature (open verification) over SignBytes
-//  6. every transaction has a valid signature (open verification) and
+//  7. every transaction has a valid signature (open verification) and
 //     applies cleanly to the evolving state
-//  7. fees flow to the proposer, without overflowing anyone's balance
+//  8. fees flow to the proposer, without overflowing anyone's balance
 //
 // On any failure the parent state is untouched.
 func ApplyBlock(parent *State, reg *crypto.Registry, block *protocol.Block) (*State, error) {
@@ -95,6 +156,9 @@ func ApplyBlock(parent *State, reg *crypto.Registry, block *protocol.Block) (*St
 	}
 	if root := block.ComputeTxRoot(); !root.Equal(block.Header.TxRoot) {
 		return nil, fmt.Errorf("state: tx root mismatch at height %d", block.Header.Height)
+	}
+	if err := parent.checkTimestamp(&block.Header); err != nil {
+		return nil, err
 	}
 
 	// The proposer must be a registered, staked account, and the header
@@ -138,6 +202,7 @@ func ApplyBlock(parent *State, reg *crypto.Registry, block *protocol.Block) (*St
 
 	next.Height = block.Header.Height
 	next.LastBlockHash = block.Header.Hash()
+	next.LastBlockTime = block.Header.Timestamp
 	next.SettleUnbondings()
 	return next, nil
 }
@@ -155,6 +220,26 @@ func verifyHeader(parent *State, reg *crypto.Registry, h *protocol.BlockHeader) 
 	}
 	if err := v.Verify(crypto.PublicKey(acc.PubKey), h.SignBytes(), h.ProposerSig); err != nil {
 		return fmt.Errorf("header signature rejected: %w", err)
+	}
+	return nil
+}
+
+// checkTimestamp enforces the chain clock: child timestamps must be
+// strictly greater than the parent's (monotonic time, so light-client
+// proofs and expiry logic cannot be attacked with time travel) and must
+// not exceed the verifying node's wall clock by more than
+// MaxFutureBlockTime (so a broken proposer clock cannot advance the
+// chain's notion of "now" without bound). The parent's LastBlockTime of 0
+// means "no previous block", which skips the monotonic check (genesis
+// edge).
+func (s *State) checkTimestamp(h *protocol.BlockHeader) error {
+	if s.LastBlockTime != 0 && h.Timestamp <= s.LastBlockTime {
+		return fmt.Errorf("state: block timestamp %d not after parent %d",
+			h.Timestamp, s.LastBlockTime)
+	}
+	now := uint64(time.Now().UnixMilli())
+	if h.Timestamp > now+uint64(MaxFutureBlockTime/time.Millisecond) {
+		return fmt.Errorf("state: block timestamp %d too far in the future", h.Timestamp)
 	}
 	return nil
 }

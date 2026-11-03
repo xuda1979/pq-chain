@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/your-org/pq-chain-public/crypto"
 	"github.com/your-org/pq-chain-public/protocol"
@@ -317,6 +318,231 @@ func TestApplyBlockValidatesAndRoutesFees(t *testing.T) {
 		t.Fatalf("staked = %d", got)
 	}
 	_ = pk
+}
+
+// TestEnrollmentSelfCertifying covers the first-registration path: an
+// unregistered account may ONLY send TxRegisterKey, the payload key must
+// derive to the sender address, and once registered the account can send
+// ordinary transactions.
+func TestEnrollmentSelfCertifying(t *testing.T) {
+	s, reg, _, _, _ := newTestChain(t)
+	fresh := crypto.NewMLDSA65()
+	freshPK, freshSK, err := fresh.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := crypto.DeriveAddress(protocol.SchemeMLDSA65, freshPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fund but do not register.
+	s.Accounts[addr] = &Account{Balance: 100 * MinStake}
+
+	// Non-register tx from an unregistered account: rejected.
+	bad := &protocol.Transaction{
+		Sender: addr, Nonce: 0, Kind: protocol.TxTransfer,
+		To: protocol.Address{9}, Amount: MinStake, Fee: BaseFee,
+		SigScheme: protocol.SchemeMLDSA65,
+	}
+	if sig, err := fresh.Sign(freshSK, bad.SignBytes()); err != nil {
+		t.Fatal(err)
+	} else {
+		bad.Signature = sig
+	}
+	if err := VerifyTransaction(s, reg, bad); err == nil {
+		t.Fatal("transfer from unregistered account accepted")
+	}
+
+	// Enrollment whose payload key does NOT derive to the sender: rejected.
+	otherPK, _, err := fresh.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := &protocol.Transaction{
+		Sender: addr, Nonce: 0, Kind: protocol.TxRegisterKey,
+		Fee: BaseFee, Payload: otherPK, SigScheme: protocol.SchemeMLDSA65,
+	}
+	if sig, err := fresh.Sign(freshSK, wrong.SignBytes()); err != nil {
+		t.Fatal(err)
+	} else {
+		wrong.Signature = sig
+	}
+	if err := VerifyTransaction(s, reg, wrong); err == nil {
+		t.Fatal("enrollment with mismatched key accepted")
+	}
+
+	// Malformed payload (wrong size for the scheme): rejected.
+	garbage := &protocol.Transaction{
+		Sender: addr, Nonce: 0, Kind: protocol.TxRegisterKey,
+		Fee: BaseFee, Payload: []byte{1, 2, 3}, SigScheme: protocol.SchemeMLDSA65,
+	}
+	if sig, err := fresh.Sign(freshSK, garbage.SignBytes()); err != nil {
+		t.Fatal(err)
+	} else {
+		garbage.Signature = sig
+	}
+	if _, err := s.ApplyTransaction(garbage); err == nil {
+		t.Fatal("malformed enrollment payload accepted")
+	}
+
+	// Correct enrollment: accepted, account becomes registered.
+	enroll := &protocol.Transaction{
+		Sender: addr, Nonce: 0, Kind: protocol.TxRegisterKey,
+		Fee: BaseFee, Payload: freshPK, SigScheme: protocol.SchemeMLDSA65,
+	}
+	sig, err := fresh.Sign(freshSK, enroll.SignBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enroll.Signature = sig
+	next, err := s.ApplyTransaction(enroll)
+	if err != nil {
+		t.Fatalf("enrollment: %v", err)
+	}
+	if !next.Accounts[addr].Registered() {
+		t.Fatal("account not registered after enrollment")
+	}
+
+	// Now ordinary transactions work.
+	tx := &protocol.Transaction{
+		Sender: addr, Nonce: 1, Kind: protocol.TxTransfer,
+		To: protocol.Address{9}, Amount: MinStake, Fee: BaseFee,
+		SigScheme: protocol.SchemeMLDSA65,
+	}
+	if sig, err := fresh.Sign(freshSK, tx.SignBytes()); err != nil {
+		t.Fatal(err)
+	} else {
+		tx.Signature = sig
+	}
+	if err := VerifyTransaction(next, reg, tx); err != nil {
+		t.Fatalf("post-enrollment transfer: %v", err)
+	}
+}
+
+// TestCrossSchemeRotation rotates a registered ML-DSA-65 account to an
+// ML-DSA-44 key: the rotation signature is made with the OLD key (which
+// authorizes it), the new scheme rides in Payload/SigScheme, and after
+// rotation the account signs with the new scheme.
+func TestCrossSchemeRotation(t *testing.T) {
+	s, reg, _, _, sk := newTestChain(t)
+	sender := senderAddr(t, s)
+
+	newSuite := crypto.NewMLDSA44()
+	newPK, newSK, err := newSuite.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(newSuite); err != nil {
+		t.Fatal(err)
+	}
+
+	rotate := &protocol.Transaction{
+		Sender: sender, Nonce: 0, Kind: protocol.TxRegisterKey,
+		Fee: BaseFee, Payload: newPK, SigScheme: protocol.SchemeMLDSA44,
+	}
+	// Signed with the OLD (registered) key — that is the authorization.
+	oldSuite := crypto.NewMLDSA65()
+	sig, err := oldSuite.Sign(sk, rotate.SignBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotate.Signature = sig
+
+	next, err := s.ApplyTransaction(rotate)
+	if err != nil {
+		t.Fatalf("cross-scheme rotation: %v", err)
+	}
+	acc := next.Accounts[sender]
+	if acc.SigScheme != protocol.SchemeMLDSA44 {
+		t.Fatalf("scheme = %s, want ML-DSA-44", acc.SigScheme)
+	}
+	if !bytes.Equal(acc.PubKey, newPK) {
+		t.Fatal("rotated key not installed")
+	}
+
+	// After rotation the account signs with the NEW scheme.
+	tx := &protocol.Transaction{
+		Sender: sender, Nonce: 1, Kind: protocol.TxTransfer,
+		To: protocol.Address{9}, Amount: MinStake, Fee: BaseFee,
+		SigScheme: protocol.SchemeMLDSA44,
+	}
+	sig2, err := newSuite.Sign(newSK, tx.SignBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Signature = sig2
+	if err := VerifyTransaction(next, reg, tx); err != nil {
+		t.Fatalf("post-rotation tx under new scheme: %v", err)
+	}
+
+	// A signature under the OLD key no longer authorizes anything.
+	stale := &protocol.Transaction{
+		Sender: sender, Nonce: 2, Kind: protocol.TxTransfer,
+		To: protocol.Address{9}, Amount: MinStake, Fee: BaseFee,
+		SigScheme: protocol.SchemeMLDSA65,
+	}
+	sig3, err := oldSuite.Sign(sk, stale.SignBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Signature = sig3
+	if err := VerifyTransaction(next, reg, stale); err == nil {
+		t.Fatal("old-scheme tx accepted after rotation")
+	}
+}
+
+// TestBlockTimestampValidation exercises the chain clock: timestamps must
+// be strictly increasing and must not drift too far into the future.
+func TestBlockTimestampValidation(t *testing.T) {
+	s, reg, suite, _, _ := newTestChain(t)
+	proposer, proposerSK := newStakedProposer(t, s, suite)
+	parent := &protocol.BlockHeader{Version: 1, Height: 1, Proposer: proposer}
+	s.LastBlockHash = parent.Hash()
+	s.Height = 1
+	_ = reg
+
+	now := uint64(time.Now().UnixMilli())
+	makeBlock := func(ts uint64, prevTime uint64) *protocol.Block {
+		child := s.Clone()
+		child.LastBlockTime = prevTime
+		b := &protocol.Block{Header: protocol.BlockHeader{
+			Version: 1, Height: 2, Timestamp: ts,
+			PrevHash: parent.Hash(), Proposer: proposer,
+		}}
+		b.Header.TxRoot = b.ComputeTxRoot()
+		signBlock(t, suite, proposerSK, &b.Header)
+		return b
+	}
+
+	// Non-monotonic timestamp: rejected.
+	if _, err := ApplyBlock(mkState(s, 1000), reg, makeBlock(999, 1000)); err == nil {
+		t.Fatal("non-monotonic timestamp accepted")
+	}
+	// Equal timestamp: rejected.
+	if _, err := ApplyBlock(mkState(s, 1000), reg, makeBlock(1000, 1000)); err == nil {
+		t.Fatal("equal timestamp accepted")
+	}
+	// Far-future timestamp: rejected.
+	far := now + uint64(MaxFutureBlockTime/time.Millisecond) + 60_000
+	if _, err := ApplyBlock(mkState(s, 1000), reg, makeBlock(far, 1000)); err == nil {
+		t.Fatal("far-future timestamp accepted")
+	}
+	// Valid timestamp: accepted, and LastBlockTime advances.
+	valid := now - 1000
+	next, err := ApplyBlock(mkState(s, 1000), reg, makeBlock(valid, 1000))
+	if err != nil {
+		t.Fatalf("valid timestamp rejected: %v", err)
+	}
+	if next.LastBlockTime != valid {
+		t.Fatalf("LastBlockTime = %d, want %d", next.LastBlockTime, valid)
+	}
+}
+
+// mkState returns s with LastBlockTime overridden, for timestamp tests.
+func mkState(s *State, lastTime uint64) *State {
+	c := s.Clone()
+	c.LastBlockTime = lastTime
+	return c
 }
 
 // signBlock signs a block header in place with the proposer's key.

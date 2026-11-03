@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -13,6 +12,8 @@ import (
 // testHandler is an in-memory fake plugin implementation.
 type testHandler struct {
 	scheme uint8
+	// panicOnSign makes Sign panic, to test panic isolation.
+	panicOnSign bool
 }
 
 func (h *testHandler) Scheme() uint8 { return h.scheme }
@@ -30,6 +31,9 @@ func (h *testHandler) GenerateKeyPair() ([]byte, []byte, error) {
 }
 
 func (h *testHandler) Sign(privateKey, message []byte) ([]byte, error) {
+	if h.panicOnSign {
+		panic("vendor bug: sign exploded")
+	}
 	// Deterministic fake "signature": privateKey XOR message, repeated.
 	out := make([]byte, 64)
 	for i := range out {
@@ -49,18 +53,9 @@ func TestProtocolRoundTrip(t *testing.T) {
 		return
 	}
 
-	// Build a tiny launcher that re-runs this test binary as the plugin.
+	// Spawn ourselves as the plugin: the wrapper sets the child-mode env
+	// var and re-runs this test binary with only this test.
 	dir := t.TempDir()
-	launcher := filepath.Join(dir, "fake-plugin")
-	src := "#!/bin/sh\nexec \"" + os.Args[0] + "\" -test.run=TestProtocolRoundTrip -test.v\ngit "
-	_ = os.WriteFile(launcher, []byte(src), 0o755)
-
-	// The child needs BE_PLUGIN_CHILD=1 in its environment.
-	cmd := exec.Command(launcher)
-	cmd.Env = append(os.Environ(), "BE_PLUGIN_CHILD=1")
-	_ = cmd
-
-	// Simpler: spawn ourselves with the env var via Dial on a wrapper.
 	wrapper := filepath.Join(dir, "wrap.sh")
 	_ = os.WriteFile(wrapper, []byte("#!/bin/sh\nBE_PLUGIN_CHILD=1 exec \""+os.Args[0]+"\" -test.run=TestProtocolRoundTrip\n"), 0o755)
 
@@ -97,6 +92,48 @@ func TestProtocolRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(sig, want) {
 		t.Fatal("fake signature mismatch")
+	}
+}
+
+// TestProtocolRoundTripPanicIsolation runs a plugin whose Sign panics: the
+// panic must surface as an RPC error, and the plugin process must survive
+// to serve later calls (a dead plugin takes the node's accelerated
+// signing down with it).
+func TestProtocolRoundTripPanicIsolation(t *testing.T) {
+	if os.Getenv("BE_PLUGIN_CHILD_PANIC") == "1" {
+		if err := Serve(&testHandler{scheme: 2, panicOnSign: true}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "wrap.sh")
+	_ = os.WriteFile(wrapper, []byte("#!/bin/sh\nBE_PLUGIN_CHILD_PANIC=1 exec \""+os.Args[0]+"\" -test.run=TestProtocolRoundTripPanicIsolation\n"), 0o755)
+
+	client, err := Dial(wrapper)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	// Scheme still works (panics are per-request, not fatal).
+	scheme, err := client.Scheme()
+	if err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	if scheme != 2 {
+		t.Fatalf("scheme = %d, want 2", scheme)
+	}
+
+	// Sign returns an RPC error, not a dead connection.
+	if _, err := client.Sign([]byte("k"), []byte("m")); err == nil {
+		t.Fatal("panicking sign reported success")
+	}
+
+	// The plugin is still alive: scheme works again.
+	if _, err := client.Scheme(); err != nil {
+		t.Fatalf("plugin died after panic: %v", err)
 	}
 }
 

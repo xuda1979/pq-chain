@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -137,6 +138,11 @@ func Dial(binPath string) (*Client, error) {
 			return
 		}
 		handshakeLine <- line
+		// Keep draining stdout for the plugin's lifetime: if the plugin
+		// logs after the handshake and nobody reads, the OS pipe buffer
+		// (64 KiB) fills and the plugin blocks — looking exactly like a
+		// hung plugin. Discarded output keeps the child running.
+		io.Copy(io.Discard, lineReader)
 	}()
 
 	var line string
@@ -162,6 +168,13 @@ func Dial(binPath string) (*Client, error) {
 		return nil, fmt.Errorf("%w: bad handshake %q", ErrHandshake, line)
 	}
 	sockPath := parts[1]
+	// The plugin must create its socket inside the private temp dir the
+	// node gave it. Refuse anything else: a hostile or buggy plugin must
+	// not be able to point the node at an unrelated system socket.
+	if filepath.Dir(sockPath) != sockDir {
+		cleanup(cmd)
+		return nil, fmt.Errorf("%w: socket path %q outside %s", ErrHandshake, sockPath, sockDir)
+	}
 	var abi int
 	if _, err := fmt.Sscanf(parts[2], "%d", &abi); err != nil {
 		cleanup(cmd)
