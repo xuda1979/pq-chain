@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // testHandler is an in-memory fake plugin implementation.
@@ -134,6 +138,112 @@ func TestProtocolRoundTripPanicIsolation(t *testing.T) {
 	// The plugin is still alive: scheme works again.
 	if _, err := client.Scheme(); err != nil {
 		t.Fatalf("plugin died after panic: %v", err)
+	}
+}
+
+// TestProtocolConcurrentClients hammers one plugin connection from many
+// goroutines, as a busy node would: RPCs are serialized internally, and
+// every response must correlate to its own request (no crossed streams,
+// no deadlocks under queueing).
+func TestProtocolConcurrentClients(t *testing.T) {
+	if os.Getenv("BE_PLUGIN_CHILD") == "1" {
+		if err := Serve(&testHandler{scheme: 2}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "wrap.sh")
+	_ = os.WriteFile(wrapper, []byte("#!/bin/sh\nBE_PLUGIN_CHILD=1 exec \""+os.Args[0]+"\" -test.run=TestProtocolConcurrentClients\n"), 0o755)
+
+	client, err := Dial(wrapper)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	const workers = 16
+	const perWorker = 25
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*perWorker)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				sk := []byte{byte(w), byte(i)}
+				msg := []byte{byte(w), byte(i), 'l', 'o', 'a', 'd'}
+				sig, err := client.Sign(sk, msg)
+				if err != nil {
+					errs <- fmt.Errorf("worker %d call %d: %w", w, i, err)
+					return
+				}
+				want := make([]byte, 64)
+				for k := range want {
+					want[k] = sk[k%len(sk)] ^ msg[k%len(msg)]
+				}
+				if !bytes.Equal(sig, want) {
+					errs <- fmt.Errorf("worker %d call %d: crossed response", w, i)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// TestPluginExitsWhenNodeDiesBeforeDial pins the orphan defense for the
+// worst case: the node spawns the plugin, then crashes (or is killed)
+// before ever dialing the socket. The plugin must notice the stdin EOF
+// and exit by itself — a fleet must never accumulate zombie plugins
+// behind crashed nodes. The child is spawned directly (no wrapper): the
+// test holds the stdin pipe, closes it to simulate node death, and
+// waits for the child to exit.
+func TestPluginExitsWhenNodeDiesBeforeDial(t *testing.T) {
+	if os.Getenv("BE_PLUGIN_CHILD") == "1" {
+		if err := Serve(&testHandler{scheme: 2}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	sockDir := filepath.Join(dir, "sock")
+	if err := os.Mkdir(sockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestPluginExitsWhenNodeDiesBeforeDial")
+	cmd.Env = append(os.Environ(),
+		"BE_PLUGIN_CHILD=1",
+		"PLUGIN_UNIX_SOCKET_DIR="+sockDir,
+	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate node death before dial: close stdin without connecting.
+	// The plugin is blocked in Accept; only the stdin watch can save it.
+	_ = stdin.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		// Plugin exited on its own: orphan defense works.
+	case <-time.After(15 * time.Second):
+		cmd.Process.Kill()
+		<-done
+		t.Fatal("plugin still running 15s after node death: orphaned")
 	}
 }
 

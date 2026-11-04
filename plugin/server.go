@@ -11,10 +11,16 @@ import (
 )
 
 // Serve runs the plugin side of the protocol: create the socket, print the
-// handshake, then serve JSON-RPC until stdin/stdout close. handler
+// handshake, then serve JSON-RPC until the node disconnects. handler
 // implements the actual crypto; this function only does transport. Vendors
 // writing closed-source plugins implement Handler and link this open-source
 // transport, so the wire protocol is always compatible.
+//
+// The plugin watches its stdin: the node holds the write end open for the
+// plugin's lifetime, so stdin EOF means the node has died or shut down
+// without a polite Close. In that case the plugin exits instead of leaking
+// as an orphan process on the host (a fleet of nodes must never leave a
+// trail of zombie plugins behind crashed nodes).
 func Serve(handler Handler) error {
 	sockDir := os.Getenv("PLUGIN_UNIX_SOCKET_DIR")
 	if sockDir == "" {
@@ -27,12 +33,31 @@ func Serve(handler Handler) error {
 	}
 	defer os.Remove(sockPath)
 
+	// Node-death watch: exit when stdin closes. This goroutine is the
+	// only way out when the node never dials (crash between spawn and
+	// dial) or dies mid-session. Closing the listener unblocks Accept;
+	// an established session is ended separately by the socket EOF that
+	// follows the node's death.
+	stdinClosed := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, os.Stdin)
+		close(stdinClosed)
+		ln.Close()
+	}()
+
 	// Handshake: node reads this line from our stdout.
 	fmt.Printf("%s|%s|%d\n", HandshakePrefix, sockPath, PluginABIVersion)
 	os.Stdout.Sync()
 
 	conn, err := ln.Accept()
 	if err != nil {
+		// stdin EOF means the node died before dialing: that is a clean
+		// shutdown, not a plugin failure.
+		select {
+		case <-stdinClosed:
+			return nil
+		default:
+		}
 		return fmt.Errorf("plugin: accept: %w", err)
 	}
 	defer conn.Close()

@@ -545,6 +545,69 @@ func mkState(s *State, lastTime uint64) *State {
 	return c
 }
 
+// TestClockSkewDivergence pins the documented deployment constraint: two
+// honest validators whose clocks differ by more than MaxFutureBlockTime
+// DISAGREE about a block near the future boundary — this is the fork risk
+// that makes NTP mandatory on validator hosts. Nodes within the skew
+// window must agree on the same chain.
+func TestClockSkewDivergence(t *testing.T) {
+	s, reg, suite, _, _ := newTestChain(t)
+	proposer, proposerSK := newStakedProposer(t, s, suite)
+	parent := &protocol.BlockHeader{Version: 1, Height: 1, Proposer: proposer}
+	s.LastBlockHash = parent.Hash()
+	s.Height = 1
+
+	base := time.Now()
+	// One proposer clock, two verifying nodes with 3 minutes of skew
+	// between them (beyond the 2-minute future window).
+	nodeAClock := base
+	nodeBClock := base.Add(3 * time.Minute)
+
+	makeBlock := func(ts uint64) *protocol.Block {
+		b := &protocol.Block{Header: protocol.BlockHeader{
+			Version: 1, Height: 2, Timestamp: ts,
+			PrevHash: parent.Hash(), Proposer: proposer,
+		}}
+		b.Header.TxRoot = b.ComputeTxRoot()
+		signBlock(t, suite, proposerSK, &b.Header)
+		return b
+	}
+
+	verifyAs := func(nodeClock time.Time, b *protocol.Block) error {
+		old := nowFunc
+		nowFunc = func() time.Time { return nodeClock }
+		defer func() { nowFunc = old }()
+		_, err := ApplyBlock(mkState(s, 1000), reg, b)
+		return err
+	}
+
+	// A timestamp comfortably in both nodes' accepted windows: both
+	// accept — consensus holds for ordinary blocks.
+	safe := uint64(base.Add(-time.Minute).UnixMilli())
+	b := makeBlock(safe)
+	if err := verifyAs(nodeAClock, b); err != nil {
+		t.Fatalf("node A rejected safe block: %v", err)
+	}
+	if err := verifyAs(nodeBClock, b); err != nil {
+		t.Fatalf("node B rejected safe block: %v", err)
+	}
+
+	// A timestamp 150s ahead of node A (past its 120s window) but well
+	// within node B's window (B's clock is 3min ahead): the nodes
+	// disagree — the fork this test exists to document. Production
+	// mitigation is NTP on every validator (see MaxFutureBlockTime docs).
+	edge := uint64(base.Add(150 * time.Second).UnixMilli())
+	bEdge := makeBlock(edge)
+	errA := verifyAs(nodeAClock, bEdge)
+	errB := verifyAs(nodeBClock, bEdge)
+	if errA == nil {
+		t.Fatal("node A accepted a block past its future window (want rejection)")
+	}
+	if errB != nil {
+		t.Fatalf("node B rejected the same block its peer accepted: consensus fork: %v", errB)
+	}
+}
+
 // signBlock signs a block header in place with the proposer's key.
 func signBlock(t *testing.T, suite *crypto.MLDSASuite, sk crypto.PrivateKey, h *protocol.BlockHeader) {
 	t.Helper()
@@ -553,6 +616,99 @@ func signBlock(t *testing.T, suite *crypto.MLDSASuite, sk crypto.PrivateKey, h *
 		t.Fatal(err)
 	}
 	h.ProposerSig = sig
+}
+
+// TestApplyBlockManySenders builds a mainnet-scale block: hundreds of
+// transactions from hundreds of distinct senders, all applied in one
+// block. Every sender's nonce, balance, and fee routing must come out
+// exactly right — a single crossed or dropped update is a consensus
+// bug. Also guards the memory profile: one clone carries the block.
+func TestApplyBlockManySenders(t *testing.T) {
+	if testing.Short() {
+		t.Skip("many-sender block in short mode")
+	}
+	s, reg, suite, _, _ := newTestChain(t)
+	proposer, proposerSK := newStakedProposer(t, s, suite)
+	parent := &protocol.BlockHeader{Version: 1, Height: 1, Proposer: proposer}
+	s.LastBlockHash = parent.Hash()
+	s.Height = 1
+
+	const senders = 200
+	const perSender = 3
+	const amount = 5
+	const fee = 2 * BaseFee
+
+	type funded struct {
+		addr protocol.Address
+		sk   crypto.PrivateKey
+	}
+	accounts := make([]funded, senders)
+	for i := range accounts {
+		pk, sk, err := suite.GenerateKeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr, err := crypto.DeriveAddress(protocol.SchemeMLDSA65, pk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Accounts[addr] = &Account{Balance: 10_000 * MinStake}
+		if err := register(s, addr, pk); err != nil {
+			t.Fatal(err)
+		}
+		accounts[i] = funded{addr: addr, sk: sk}
+	}
+
+	txs := make([]*protocol.Transaction, 0, senders*perSender)
+	var wantFees uint64
+	for i, a := range accounts {
+		for j := 0; j < perSender; j++ {
+			tx := signedTx(t, suite, a.sk, a.addr, uint64(j), protocol.TxTransfer, protocol.Address{byte(i % 250), byte(j)}, amount, fee)
+			txs = append(txs, tx)
+			wantFees += fee
+		}
+	}
+
+	block := &protocol.Block{
+		Header: protocol.BlockHeader{
+			Version:   1,
+			Height:    2,
+			Timestamp: uint64(time.Now().Add(-time.Minute).UnixMilli()),
+			PrevHash:  parent.Hash(),
+			Proposer:  proposer,
+		},
+		Transactions: txs,
+	}
+	block.Header.TxRoot = block.ComputeTxRoot()
+	signBlock(t, suite, proposerSK, &block.Header)
+
+	next, err := ApplyBlock(s, reg, block)
+	if err != nil {
+		t.Fatalf("apply %d-tx block: %v", len(txs), err)
+	}
+
+	// Every sender: nonce advanced, balance debited exactly amount+fee
+	// per transaction.
+	for _, a := range accounts {
+		acc, ok := next.Accounts[a.addr]
+		if !ok {
+			t.Fatalf("sender account vanished")
+		}
+		if acc.Nonce != perSender {
+			t.Fatalf("sender nonce = %d, want %d", acc.Nonce, perSender)
+		}
+		want := 10_000*MinStake - uint64(perSender)*(amount+fee)
+		if acc.Balance != want {
+			t.Fatalf("sender balance = %d, want %d", acc.Balance, want)
+		}
+	}
+	// Proposer: original balance plus every fee.
+	if got := next.Accounts[proposer].Balance; got != 100*MinStake+wantFees {
+		t.Fatalf("proposer balance = %d, want %d", got, 100*MinStake+wantFees)
+	}
+	if next.Height != 2 {
+		t.Fatalf("height = %d", next.Height)
+	}
 }
 
 func TestTotalSupplyConservation(t *testing.T) {

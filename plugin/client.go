@@ -84,9 +84,14 @@ type Client struct {
 	cmd     *exec.Cmd
 	conn    net.Conn
 	sockDir string
-	mu      sync.Mutex
-	enc     *json.Encoder
-	dec     *json.Decoder
+	// stdinWrite stays open for the plugin's lifetime; closing it on
+	// Close signals the plugin (which watches stdin) to exit. If the
+	// node process dies without Close, the OS closes the pipe and the
+	// plugin still exits — no orphan processes across a fleet.
+	stdinWrite io.WriteCloser
+	mu         sync.Mutex
+	enc        *json.Encoder
+	dec        *json.Decoder
 	// nextID is only mutated under mu.
 	nextID uint64
 	// closeOnce makes Close idempotent.
@@ -116,6 +121,14 @@ func Dial(binPath string) (*Client, error) {
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), "PLUGIN_UNIX_SOCKET_DIR="+sockDir)
 	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		os.RemoveAll(sockDir)
+		return nil, err
+	}
+	// stdin is a pipe the node keeps open for the plugin's lifetime. The
+	// plugin watches it and exits on EOF — this is the orphan-process
+	// defense when the node crashes without calling Close.
+	stdinWrite, err := cmd.StdinPipe()
 	if err != nil {
 		os.RemoveAll(sockDir)
 		return nil, err
@@ -198,12 +211,13 @@ func Dial(binPath string) (*Client, error) {
 	}()
 
 	return &Client{
-		cmd:     cmd,
-		conn:    conn,
-		sockDir: sockDir,
-		enc:     json.NewEncoder(conn),
-		dec:     json.NewDecoder(bufio.NewReader(conn)),
-		waitCh:  waitCh,
+		cmd:        cmd,
+		conn:       conn,
+		sockDir:    sockDir,
+		stdinWrite: stdinWrite,
+		enc:        json.NewEncoder(conn),
+		dec:        json.NewDecoder(bufio.NewReader(conn)),
+		waitCh:     waitCh,
 	}, nil
 }
 
@@ -213,6 +227,11 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		if c.conn != nil {
 			c.conn.Close()
+		}
+		// Closing stdin tells a well-behaved plugin to exit on its own;
+		// the Kill below is the backstop for plugins that don't watch.
+		if c.stdinWrite != nil {
+			c.stdinWrite.Close()
 		}
 		if c.cmd != nil && c.cmd.Process != nil {
 			c.cmd.Process.Kill()

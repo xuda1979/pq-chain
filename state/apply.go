@@ -44,7 +44,20 @@ func NewGenesis(alloc []Allocation) (*State, error) {
 // relative to the verifying node's clock. Blocks further ahead are
 // rejected so a faulty clock on one proposer cannot push the chain's
 // median time forward unboundedly.
+//
+// DEPLOYMENT REQUIREMENT (consensus-critical): this check compares
+// against each node's LOCAL wall clock. Two honest validators whose
+// clocks differ by more than MaxFutureBlockTime can disagree about a
+// block near the boundary — a consensus fork. Validator hosts MUST run
+// NTP (or equivalent) with skew far below MaxFutureBlockTime. A fully
+// deterministic alternative (Bitcoin-style median-time-past) is the
+// production migration path if untrusted validator time ever becomes
+// acceptable to constrain this way.
 const MaxFutureBlockTime = 2 * time.Minute
+
+// nowFunc is the clock seam. Tests override it to pin the wall clock;
+// production code must never touch it.
+var nowFunc = time.Now
 
 // VerifyTransaction checks a transaction's signature against the
 // sender's registered on-chain key using only OPEN-SOURCE verification.
@@ -237,7 +250,7 @@ func (s *State) checkTimestamp(h *protocol.BlockHeader) error {
 		return fmt.Errorf("state: block timestamp %d not after parent %d",
 			h.Timestamp, s.LastBlockTime)
 	}
-	now := uint64(time.Now().UnixMilli())
+	now := uint64(nowFunc().UnixMilli())
 	if h.Timestamp > now+uint64(MaxFutureBlockTime/time.Millisecond) {
 		return fmt.Errorf("state: block timestamp %d too far in the future", h.Timestamp)
 	}
