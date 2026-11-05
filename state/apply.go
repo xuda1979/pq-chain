@@ -167,6 +167,14 @@ func ApplyBlock(parent *State, reg *crypto.Registry, block *protocol.Block) (*St
 	if !block.Header.PrevHash.Equal(parent.LastBlockHash) {
 		return nil, fmt.Errorf("state: prev hash mismatch at height %d", block.Header.Height)
 	}
+	// Block size limit first, before any O(n) work: an oversized block
+	// must be rejected without hashing or verifying a single transaction.
+	// Without this, a staked proposer could cheaply force every node into
+	// unbounded verification time per block (resource-exhaustion vector).
+	if len(block.Transactions) > protocol.MaxBlockTransactions {
+		return nil, fmt.Errorf("state: block has %d transactions, limit %d",
+			len(block.Transactions), protocol.MaxBlockTransactions)
+	}
 	if root := block.ComputeTxRoot(); !root.Equal(block.Header.TxRoot) {
 		return nil, fmt.Errorf("state: tx root mismatch at height %d", block.Header.Height)
 	}

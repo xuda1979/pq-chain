@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -708,6 +709,58 @@ func TestApplyBlockManySenders(t *testing.T) {
 	}
 	if next.Height != 2 {
 		t.Fatalf("height = %d", next.Height)
+	}
+}
+
+// TestApplyBlockRejectsOversizedBlock pins the consensus block-size limit:
+// a block beyond MaxBlockTransactions must be rejected BEFORE any
+// per-transaction work (hashing, signature verification) runs. This is
+// the resource-exhaustion guard: verification cost per block must be
+// bounded and known on every node.
+func TestApplyBlockRejectsOversizedBlock(t *testing.T) {
+	s, reg, suite, _, _ := newTestChain(t)
+	proposer, proposerSK := newStakedProposer(t, s, suite)
+	parent := &protocol.BlockHeader{Version: 1, Height: 1, Proposer: proposer}
+	s.LastBlockHash = parent.Hash()
+	s.Height = 1
+
+	// One over the limit. Building MaxBlockTransactions+1 tiny
+	// transactions is cheap; they never get verified because the limit
+	// check runs first.
+	txs := make([]*protocol.Transaction, protocol.MaxBlockTransactions+1)
+	for i := range txs {
+		txs[i] = &protocol.Transaction{Sender: protocol.Address{byte(i)}, Fee: 1}
+	}
+	block := &protocol.Block{
+		Header: protocol.BlockHeader{
+			Version: 1, Height: 2,
+			Timestamp: uint64(time.Now().Add(-time.Minute).UnixMilli()),
+			PrevHash:  parent.Hash(), Proposer: proposer,
+		},
+		Transactions: txs,
+	}
+	block.Header.TxRoot = block.ComputeTxRoot()
+	signBlock(t, suite, proposerSK, &block.Header)
+
+	if _, err := ApplyBlock(s, reg, block); err == nil {
+		t.Fatal("block exceeding MaxBlockTransactions accepted")
+	}
+
+	// And exactly at the limit must NOT be rejected on the count (it will
+	// fail later on signature checks, which is the correct reason).
+	atLimit := make([]*protocol.Transaction, protocol.MaxBlockTransactions)
+	for i := range atLimit {
+		atLimit[i] = &protocol.Transaction{Sender: protocol.Address{byte(i)}, Fee: 1}
+	}
+	block.Transactions = atLimit
+	block.Header.TxRoot = block.ComputeTxRoot()
+	signBlock(t, suite, proposerSK, &block.Header)
+	_, err := ApplyBlock(s, reg, block)
+	if err == nil {
+		t.Fatal("unsigned txs accepted")
+	}
+	if strings.Contains(err.Error(), "transactions, limit") {
+		t.Fatalf("at-limit block rejected on the count check: %v", err)
 	}
 }
 
