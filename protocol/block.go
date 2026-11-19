@@ -101,6 +101,59 @@ func (h *BlockHeader) SignBytes() []byte {
 // Len returns the number of transactions in the block.
 func (b *Block) Len() int { return len(b.Transactions) }
 
+// Marshal encodes the full block (header, then transactions) canonically.
+// The encoding is self-delimiting: Block.Unmarshal rejects trailing bytes,
+// so a concatenation of block encodings is provably unambiguous.
+func (b *Block) Marshal() []byte {
+	out := PutBytes(nil, b.Header.Marshal())
+	out = PutUint32(out, uint32(len(b.Transactions)))
+	for _, tx := range b.Transactions {
+		out = PutBytes(out, tx.Marshal())
+	}
+	return out
+}
+
+// Unmarshal decodes a full block and rejects ambiguous encodings. It
+// enforces the consensus size limits before allocating. The header is
+// length-prefixed in the block wire form (unlike standalone header
+// encodings), which keeps the whole encoding unambiguous.
+func (b *Block) Unmarshal(data []byte) error {
+	r := NewReader(data)
+	hdr, err := r.Bytes()
+	if err != nil {
+		return err
+	}
+	if err := b.Header.Unmarshal(hdr); err != nil {
+		return err
+	}
+
+	txCount, err := r.Uint32()
+	if err != nil {
+		return err
+	}
+	if txCount > MaxBlockTransactions {
+		return fmt.Errorf("%w: block has %d transactions, limit %d",
+			ErrInvalidField, txCount, MaxBlockTransactions)
+	}
+	txs := make([]*Transaction, 0, txCount)
+	for i := uint32(0); i < txCount; i++ {
+		raw, err := r.Bytes()
+		if err != nil {
+			return fmt.Errorf("block tx %d: %w", i, err)
+		}
+		tx := new(Transaction)
+		if err := tx.Unmarshal(raw); err != nil {
+			return fmt.Errorf("block tx %d: %w", i, err)
+		}
+		txs = append(txs, tx)
+	}
+	if r.Remaining() != 0 {
+		return ErrTrailingBytes
+	}
+	b.Transactions = txs
+	return nil
+}
+
 // ComputeTxRoot computes the Merkle root over the transaction hashes.
 // Blocks with zero transactions use the zero hash as their TxRoot.
 func (b *Block) ComputeTxRoot() Hash {

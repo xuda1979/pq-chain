@@ -85,3 +85,81 @@ func TestComputeTxRoot(t *testing.T) {
 		t.Fatal("reordering transactions must change the tx root")
 	}
 }
+
+func TestBlockRoundTrip(t *testing.T) {
+	b := &Block{
+		Header: BlockHeader{
+			Version:   1,
+			Height:    7,
+			Timestamp: 1730000000000,
+			Proposer:  Address{9, 9, 9},
+		},
+		Transactions: []*Transaction{
+			{Nonce: 1, Kind: TxTransfer, Amount: 10, Fee: 5, SigScheme: SchemeMLDSA44},
+			{Nonce: 2, Kind: TxStake, Amount: 100, Fee: 5, SigScheme: SchemeMLDSA65, Payload: []byte("key")},
+		},
+	}
+	copy(b.Header.PrevHash[:], []byte("prev hash bytes exactly 32 long!"))
+	copy(b.Header.TxRoot[:], []byte("tx root bytes exactly 32 long!!"))
+	b.Header.ProposerSig = bytes.Repeat([]byte{0xEF}, 4627)
+	b.Transactions[0].Signature = bytes.Repeat([]byte{0x11}, 2420)
+
+	// Header hash must match the round-tripped header hash (canonical).
+	data := b.Marshal()
+	var got Block
+	if err := got.Unmarshal(data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Header.Hash() != b.Header.Hash() {
+		t.Fatal("header hash mismatch after round trip")
+	}
+	if got.Header.Height != b.Header.Height || got.Header.Proposer != b.Header.Proposer {
+		t.Fatal("header fields mismatch after round trip")
+	}
+	if len(got.Transactions) != 2 {
+		t.Fatalf("want 2 txs, got %d", len(got.Transactions))
+	}
+	for i := range got.Transactions {
+		if got.Transactions[i].Hash() != b.Transactions[i].Hash() {
+			t.Fatalf("tx %d hash mismatch after round trip", i)
+		}
+	}
+	if got.ComputeTxRoot() != b.ComputeTxRoot() {
+		t.Fatal("tx root mismatch after round trip")
+	}
+}
+
+func TestBlockRejectsTrailingBytes(t *testing.T) {
+	b := &Block{Transactions: []*Transaction{{Nonce: 1, Kind: TxTransfer, SigScheme: SchemeMLDSA44}}}
+	data := append(b.Marshal(), 0xFF, 0xFF)
+	var got Block
+	if err := got.Unmarshal(data); err == nil {
+		t.Fatal("expected error for trailing bytes")
+	}
+}
+
+func TestBlockRejectsTruncated(t *testing.T) {
+	b := &Block{
+		Header:       BlockHeader{Version: 1, Height: 1},
+		Transactions: []*Transaction{{Nonce: 1, Kind: TxTransfer, SigScheme: SchemeMLDSA44, Fee: 5}},
+	}
+	data := b.Marshal()
+	for cut := 0; cut < len(data); cut += 7 {
+		var got Block
+		if err := got.Unmarshal(data[:cut]); err == nil {
+			t.Fatalf("expected error for truncated block at cut %d", cut)
+		}
+	}
+}
+
+func TestBlockRejectsTooManyTxs(t *testing.T) {
+	data := []byte{0, 0, 0, 0} // 4 zero bytes: tx count 0 with no header
+	data[0] = 0xFF
+	data[1] = 0xFF
+	data[2] = 0xFF
+	data[3] = 0x7F // 2^31-1, above MaxBlockTransactions
+	var got Block
+	if err := got.Unmarshal(data); err == nil {
+		t.Fatal("expected error for oversized tx count")
+	}
+}
