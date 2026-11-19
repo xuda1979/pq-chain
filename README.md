@@ -5,11 +5,19 @@
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![FIPS](https://img.shields.io/badge/FIPS-204-green.svg)](https://csrc.nist.gov/pubs/fips/204/final)
 
-Post-quantum blockchain protocol reference implementation. Everything a
-node needs to **validate the chain** is in this repository, in the open.
+**PQ Chain is a blockchain whose signatures, keys, and consensus are
+natively post-quantum (ML-DSA / FIPS 204) — not bolted on.**
 
-> ML-DSA (FIPS 204) signatures · canonical serialization · plugin ABI for
-> optional accelerated signing
+Post-quantum security is the highest-switching-cost migration in the
+industry's history: NIST finalized FIPS 204 in August 2024 and the US
+federal CNSA 2.0 deadlines run 2030–2033. PQ Chain is built for that
+migration at the protocol layer.
+
+Everything a node needs to **validate the chain** is in this repository,
+in the open — Apache-2.0, `go get`-able, no closed-source dependencies
+in the consensus path.
+
+> **Design rule:** Verify is open, Sign may be accelerated.
 
 ## What lives here (and what deliberately does not)
 
@@ -40,6 +48,35 @@ crypto/     signer/verifier interfaces, ML-DSA suites, plugin loader
 plugin/     node⇄plugin wire protocol (client and server side)
 state/      account state machine, staking, tx/block application, fees
 ```
+
+## Status & roadmap
+
+| Area | Status |
+|---|---|
+| Canonical protocol (serialization, hashing, Merkle) | ✅ tested |
+| ML-DSA verification (44/65/87) | ✅ tested, consensus-critical |
+| Reference signer (network works with zero closed source) | ✅ tested |
+| State machine, staking, key rotation | ✅ tested |
+| Plugin ABI + signed-plugin loader | ✅ tested (subprocess round-trip) |
+| P2P networking / persistence / testnet | 🚧 under development |
+| Security audit | 🔜 scheduled before mainnet |
+
+The current mainnet-facing gap is the network layer. This repository
+contains everything needed to *define and validate* the chain; P2P
+transport, storage, and a public testnet are the active build target.
+
+## Why PQ Chain
+
+- **Native, not wrapped.** Signatures, addresses, key rotation, and
+  block headers are all ML-DSA. Existing projects retrofit one signature
+  scheme; PQ Chain is designed from the ground up around FIPS 204.
+- **Open verification is a guarantee, not a promise.** Any party can
+  validate any block using only this repository. The open-core split
+  keeps verification consensus-critical and open while allowing faster
+  signing as a commercial layer.
+- **Key rotation without address change.** Accounts can migrate
+  signature schemes without changing addresses — the property
+  custodians and enterprises actually need for the CNSA 2.0 window.
 
 ## Quick start
 
