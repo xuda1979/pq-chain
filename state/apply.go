@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/your-org/pq-chain-public/crypto"
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/crypto"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // Allocation is one genesis allocation entry.

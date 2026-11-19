@@ -1,8 +1,8 @@
-PQ Chain Public (pq-chain-public)
+PQ Chain (pq-chain)
 Copyright 2026 PQ Chain contributors
 
 This product includes software developed at PQ Chain
-(https://github.com/your-org/pq-chain-public).
+(https://github.com/xuda1979/pq-chain).
 
 ML-DSA (FIPS 204) and ML-KEM (FIPS 203) implementations are provided by
 the Go standard library (crypto/mldsa, crypto/mlkem), Copyright the Go

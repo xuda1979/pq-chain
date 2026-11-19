@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/your-org/pq-chain-public/crypto"
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/crypto"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // FuzzApplyTransactionArbitraryTx checks that the state machine never

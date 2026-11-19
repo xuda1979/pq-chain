@@ -3,8 +3,8 @@ package crypto
 import (
 	"fmt"
 
-	"github.com/your-org/pq-chain-public/plugin"
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/plugin"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // PluginSigner adapts a plugin.Client to the crypto.Signer interface, so

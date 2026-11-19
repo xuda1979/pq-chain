@@ -1,5 +1,10 @@
 # PQ Chain — Public (Open Source)
 
+[![Go](https://img.shields.io/badge/Go-1.27-blue.svg)](https://go.dev/dl/)
+[![CI](https://github.com/xuda1979/pq-chain/actions/workflows/ci.yml/badge.svg)](https://github.com/xuda1979/pq-chain/actions)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![FIPS](https://img.shields.io/badge/FIPS-204-green.svg)](https://csrc.nist.gov/pubs/fips/204/final)
+
 Post-quantum blockchain protocol reference implementation. Everything a
 node needs to **validate the chain** is in this repository, in the open.
 
@@ -80,8 +85,8 @@ the whitepaper "open-source policy" chapter).
 - Verification logic must remain open-source — it is consensus-critical.
   Changes to `crypto/MLDSASuite.Verify`, `protocol.*` hashing or
   serialization are hard-fork hazards and need a BIP-style review.
-- Report vulnerabilities privately to security@your-org.example
-  (see SECURITY.md).
+- Report vulnerabilities privately via GitHub private vulnerability
+  reporting (see SECURITY.md).
 - Third-party cryptographic audit of this repository is a release
   requirement for mainnet.
 

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // TestMLDSAEndToEnd exercises the full lifecycle per parameter set:

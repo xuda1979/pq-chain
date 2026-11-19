@@ -1,3 +1,3 @@
-module github.com/your-org/pq-chain-public
+module github.com/xuda1979/pq-chain
 
 go 1.27

@@ -9,8 +9,9 @@
 
 ## Reporting a vulnerability
 
-Email **security@your-org.example** (replace with the real address before
-launch). Please do not open public issues for vulnerabilities.
+Report privately via **GitHub private vulnerability reporting** on the
+repository page (`Security → Report a vulnerability`); the report goes
+only to maintainers. Please do not open public issues for vulnerabilities.
 
 - We aim to acknowledge within 48 hours.
 - Cryptographic flaws affecting consensus (hashing, serialization,

@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/your-org/pq-chain-public/plugin"
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/plugin"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // PluginSignatureFile is the detached signature over the plugin binary

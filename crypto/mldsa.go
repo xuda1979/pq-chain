@@ -5,7 +5,7 @@ import (
 	"crypto/sha3"
 	"fmt"
 
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // MLDSASuite is the open-source reference implementation of ML-DSA

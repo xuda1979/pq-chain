@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/your-org/pq-chain-public/crypto"
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/crypto"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // newTestChain builds a genesis state with one funded account that has a

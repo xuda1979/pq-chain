@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // writePkg writes a minimal plugin package for loader tests.

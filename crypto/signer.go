@@ -8,7 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
-	"github.com/your-org/pq-chain-public/protocol"
+	"github.com/xuda1979/pq-chain/protocol"
 )
 
 // PublicKey is a raw encoded public key of a post-quantum signature scheme.
